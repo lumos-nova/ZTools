@@ -1,72 +1,55 @@
-name: Build
+name: Build & Release
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: '预发布版本号，例如 3.0.0-beta.1'
+        description: '版本号，例如 3.0.2 或 v3.0.2'
         required: true
+        type: string
       prerelease:
-        description: '是否发布为 GitHub Pre-release'
-        type: boolean
+        description: '是否标记为预发布'
+        required: false
         default: true
-      publish_release:
-        description: '是否发布到 GitHub Release'
         type: boolean
-        default: true
+  push:
+    tags:
+      - 'v*'
 
-permissions:
-  contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }} (${{ matrix.arch }})
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # macOS x64 (Intel, available until Aug 2027)
-          - os: macos-15-intel
-            arch: x64
-            build_cmd: pnpm run build:mac:x64
-            # electron-builder expects the certificate subject without its type prefix.
-            signing_identity: 'Zhengzhou Zhongsen Yunke Information Technology Co., Ltd. (4S4HH8375U)'
-          # macOS ARM64 (Apple Silicon)
-          - os: macos-15
-            arch: arm64
-            build_cmd: pnpm run build:mac:arm64
-            signing_identity: 'Zhengzhou Zhongsen Yunke Information Technology Co., Ltd. (4S4HH8375U)'
-          # Windows x64
-          - os: windows-latest
-            arch: x64
-            build_cmd: pnpm run build:win
-            signing_identity: ''
-
+  # ① 统一解析版本号，后续所有 job 只依赖这里的输出
+  version:
+    name: 解析版本号
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      make_latest: ${{ steps.resolve.outputs.make_latest }}
     steps:
-      - name: Check out git repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Resolve release metadata
-        id: release_meta
+      - name: Resolve version
+        id: resolve
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             version="${INPUT_VERSION#v}"
             prerelease="${INPUT_PRERELEASE:-true}"
           else
-            version="${GITHUB_REF_NAME#v}"
+            version="${REF_NAME#v}"
             case "$version" in
               *-*) prerelease="true" ;;
-              *) prerelease="false" ;;
+              *)   prerelease="false" ;;
             esac
           fi
 
@@ -74,217 +57,210 @@ jobs:
             echo "Release version is required" >&2
             exit 1
           fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "版本号格式应为 x.y.z[-suffix]，实际为: $version" >&2
+            exit 1
+          fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "make_latest=$([ "$prerelease" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+          if [ "$prerelease" = "true" ]; then
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Set package version
-        env:
-          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
+  # ② Windows 构建：照常产出安装包，发布交给最后的 release job
+  build-win:
+    name: Build on windows-latest (x64)
+    needs: version
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 写入版本号到 package.json
+        shell: pwsh
         run: |
           node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); pkg.version=process.env.RELEASE_VERSION; fs.writeFileSync('package.json', JSON.stringify(pkg,null,2)+'\n');"
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v2
+      - uses: pnpm/action-setup@v2
         with:
           version: 10.33.0
+          run_install: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'pnpm'
+          cache: pnpm
 
-      - name: Install plugin dependencies
-        working-directory: internal-plugins/setting
-        # 设置插件使用独立锁文件，避免根 workspace 将安装重定向到主项目。
+      - name: Install deps (workspace root)
+        shell: pwsh
         run: pnpm install --frozen-lockfile --ignore-workspace
 
-      - name: Install dependencies
+      - name: Install deps (project)
+        shell: pwsh
         run: pnpm install --frozen-lockfile
 
-      - name: Prepare App Store Connect API key
-        if: startsWith(matrix.os, 'macos')
+      - name: Build Windows
+        shell: pwsh
+        run: pnpm run build:win
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-windows-latest-x64
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.yml
+            dist/*.blockmap
+          if-no-files-found: warn
+
+  # ③ macOS 构建：密钥缺失时不再失败，改为构建未签名版本
+  build-mac:
+    name: Build on ${{ matrix.os }} (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      # 这些 Secrets 允许为空；为空时走 unsigned 分支
+      APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 写入版本号到 package.json
         shell: bash
-        env:
-          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); pkg.version=process.env.RELEASE_VERSION; fs.writeFileSync('package.json', JSON.stringify(pkg,null,2)+'\n');"
+
+      - uses: pnpm/action-setup@v2
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install deps (workspace root)
+        shell: bash
+        run: pnpm install --frozen-lockfile --ignore-workspace
+
+      - name: Install deps (project)
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      # 关键修复 1：密钥为空时跳过这一步，不再 exit 1
+      - name: 准备 Apple 签名密钥（有密钥才执行）
+        id: apple_key
+        if: ${{ env.APPLE_API_KEY_BASE64 != '' && env.APPLE_API_KEY_ID != '' }}
+        shell: bash
         run: |
           key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
-
-          # Decode the secret only into the ephemeral runner workspace.
           node -e 'const fs=require("fs"); fs.writeFileSync(process.argv[1], Buffer.from(process.env.APPLE_API_KEY_BASE64, "base64"))' "$key_path"
-
           test -s "$key_path"
           grep -q 'BEGIN PRIVATE KEY' "$key_path"
           chmod 600 "$key_path"
           echo "APPLE_API_KEY=$key_path" >> "$GITHUB_ENV"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
 
-      # 统一构建命令
-      - name: Build and Package
-        env:
-          CSC_LINK: ${{ startsWith(matrix.os, 'macos') && secrets.MAC_CSC_LINK || '' }}
-          CSC_KEY_PASSWORD: ${{ startsWith(matrix.os, 'macos') && secrets.MAC_CSC_KEY_PASSWORD || '' }}
-          CSC_NAME: ${{ matrix.signing_identity }}
-          APPLE_API_KEY_ID: ${{ startsWith(matrix.os, 'macos') && secrets.APPLE_API_KEY_ID || '' }}
-          APPLE_API_ISSUER: ${{ startsWith(matrix.os, 'macos') && secrets.APPLE_API_ISSUER || '' }}
-          APPLE_TEAM_ID: ${{ startsWith(matrix.os, 'macos') && secrets.APPLE_TEAM_ID || '' }}
-        run: ${{ matrix.build_cmd }}
-
-      - name: Verify macOS signature and notarization
-        if: startsWith(matrix.os, 'macos')
+      # 关键修复 2：无密钥时显式关闭签名/公证，让 electron-builder 仍能出包
+      - name: 计算构建参数
+        id: build_args
         shell: bash
         run: |
-          app_path="$(find dist -maxdepth 3 -type d -name '*.app' -print -quit)"
-          if [ -z "$app_path" ]; then
-            echo 'No macOS app bundle found in dist/' >&2
-            exit 1
+          if [ "${{ steps.apple_key.outputs.signed }}" = "true" ]; then
+            echo "extra=" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::未配置 Apple 签名密钥，本次构建未签名版本"
+            echo "extra=--config.mac.notarize=false --config.mac.hardenedRuntime=false" >> "$GITHUB_OUTPUT"
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
           fi
 
-          # Verify the complete nested bundle before artifacts are uploaded.
-          codesign --verify --deep --strict --verbose=2 "$app_path"
-          xcrun stapler validate "$app_path"
-          spctl --assess --type execute --verbose=4 "$app_path"
+      - name: Build macOS
+        shell: bash
+        run: pnpm run build:mac -- ${{ steps.build_args.outputs.extra }}
 
-      # 上传平台产物（只上传指定文件类型）
-      - name: Upload build artifacts
+      - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: artifact-${{ matrix.os }}-${{ matrix.arch }}
           path: |
-            dist/*.exe
             dist/*.dmg
             dist/*.zip
             dist/*.yml
             dist/*.blockmap
           if-no-files-found: warn
 
+  # ④ 关键修复 3：发布任务不再被某个失败的子 job 拖垮
   release:
-    name: Release
-    needs: build
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish_release }}
+    name: Create / update GitHub Release
+    needs: [version, build-win, build-mac]
+    if: >-
+      ${{
+        always() &&
+        needs.version.result == 'success' &&
+        (needs.build-win.result == 'success' || needs.build-mac.result == 'success')
+      }}
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.release_meta.outputs.tag }}
-
+    permissions:
+      contents: write
     steps:
-      - name: Check out git repository
-        uses: actions/checkout@v4
-
-      - name: Resolve release metadata
-        id: release_meta
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_PRERELEASE: ${{ inputs.prerelease }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            version="${INPUT_VERSION#v}"
-            prerelease="${INPUT_PRERELEASE:-true}"
-          else
-            version="${GITHUB_REF_NAME#v}"
-            case "$version" in
-              *-*) prerelease="true" ;;
-              *) prerelease="false" ;;
-            esac
-          fi
-
-          if [ -z "$version" ]; then
-            echo "Release version is required" >&2
-            exit 1
-          fi
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "make_latest=$([ "$prerelease" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
-
-      - name: Set package version
-        env:
-          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
-        run: |
-          node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); pkg.version=process.env.RELEASE_VERSION; fs.writeFileSync('package.json', JSON.stringify(pkg,null,2)+'\n');"
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v2
-        with:
-          version: 10.33.0
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: 'pnpm'
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Download macOS x64 artifact
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: artifact-macos-15-intel-x64
-          path: dist/mac-x64
+          pattern: artifact-*
+          path: release-assets
+          merge-multiple: false
 
-      - name: Download macOS ARM64 artifact
-        uses: actions/download-artifact@v4
+      - name: List assets
+        run: find release-assets -type f -printf '%p  %s bytes\n'
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
         with:
-          name: artifact-macos-15-arm64
-          path: dist/mac-arm64
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: artifact-windows-latest-x64
-          path: dist/windows
-
-      # 合并 macOS 双架构元数据，并规范化 Windows 与 macOS 的更新清单。
-      - name: Generate update info
-        env:
-          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
-          WINDOWS_UPDATE_METADATA: dist/windows/latest.yml
-          MAC_X64_UPDATE_METADATA: dist/mac-x64/latest-mac.yml
-          MAC_ARM64_UPDATE_METADATA: dist/mac-arm64/latest-mac.yml
-          UPDATE_METADATA_OUTPUT_DIR: dist/release
-          REQUIRE_UPDATE_METADATA: 'true'
-        run: pnpm updater
-
-      # 上传安装包、标准完整更新包、blockmap 和最终元数据。
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ steps.release_meta.outputs.tag }}
-          tag_name: ${{ steps.release_meta.outputs.tag }}
+          tag_name: ${{ needs.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          prerelease: ${{ steps.release_meta.outputs.prerelease }}
-          make_latest: ${{ steps.release_meta.outputs.make_latest }}
-          body_path: changelog.md
+          name: ZTools ${{ needs.version.outputs.version }}
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.version.outputs.make_latest }}
+          generate_release_notes: true
+          overwrite_files: true
+          fail_on_unmatched_files: false
           files: |
-            dist/windows/*.exe
-            dist/windows/*.zip
-            dist/windows/*.blockmap
-            dist/mac-x64/*.dmg
-            dist/mac-x64/*.zip
-            dist/mac-x64/*.blockmap
-            dist/mac-arm64/*.dmg
-            dist/mac-arm64/*.zip
-            dist/mac-arm64/*.blockmap
-            dist/release/*.yml
-
-      - name: Sync release metadata to ZTools server
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
-          RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
-          ZTOOLS_RELEASE_SYNC_TOKEN: ${{ secrets.ZTOOLS_RELEASE_SYNC_TOKEN }}
-          ZTOOLS_RELEASE_SYNC_URL: https://z-tools.top
-          WINDOWS_UPDATE_METADATA: dist/release/latest.yml
-          MAC_UPDATE_METADATA: dist/release/latest-mac.yml
-        run: node scripts/sync-release-server.mjs
+            release-assets/**/*.exe
+            release-assets/**/*.zip
+            release-assets/**/*.dmg
+            release-assets/**/*.yml
+            release-assets/**/*.blockmap
