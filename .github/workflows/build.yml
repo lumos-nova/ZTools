@@ -112,6 +112,12 @@ jobs:
         shell: pwsh
         run: pnpm install --frozen-lockfile
 
+      # 设置插件是独立包，pnpm 会从根目录 workspace 解析，必须显式忽略 workspace 安装
+      - name: Install deps (setting plugin)
+        shell: pwsh
+        working-directory: internal-plugins/setting
+        run: pnpm install --frozen-lockfile --ignore-workspace
+
       - name: Build Windows
         shell: pwsh
         run: pnpm run build:win
@@ -127,111 +133,118 @@ jobs:
             dist/*.blockmap
           if-no-files-found: warn
 
-  # ③ macOS 构建：密钥缺失时不再失败，改为构建未签名版本
-  build-mac:
-    name: Build on ${{ matrix.os }} (${{ matrix.arch }})
-    needs: version
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            arch: arm64
-          - os: macos-15-intel
-            arch: x64
-    permissions:
-      contents: read
-    env:
-      RELEASE_VERSION: ${{ needs.version.outputs.version }}
-      # 这些 Secrets 允许为空；为空时走 unsigned 分支
-      APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: 写入版本号到 package.json
-        shell: bash
-        run: |
-          node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); pkg.version=process.env.RELEASE_VERSION; fs.writeFileSync('package.json', JSON.stringify(pkg,null,2)+'\n');"
-
-      - uses: pnpm/action-setup@v2
-        with:
-          version: 10.33.0
-          run_install: false
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Install deps (workspace root)
-        shell: bash
-        run: pnpm install --frozen-lockfile --ignore-workspace
-
-      - name: Install deps (project)
-        shell: bash
-        run: pnpm install --frozen-lockfile
-
-      # 关键修复 1：密钥为空时跳过这一步，不再 exit 1
-      - name: 准备 Apple 签名密钥（有密钥才执行）
-        id: apple_key
-        if: ${{ env.APPLE_API_KEY_BASE64 != '' && env.APPLE_API_KEY_ID != '' }}
-        shell: bash
-        run: |
-          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
-          node -e 'const fs=require("fs"); fs.writeFileSync(process.argv[1], Buffer.from(process.env.APPLE_API_KEY_BASE64, "base64"))' "$key_path"
-          test -s "$key_path"
-          grep -q 'BEGIN PRIVATE KEY' "$key_path"
-          chmod 600 "$key_path"
-          echo "APPLE_API_KEY=$key_path" >> "$GITHUB_ENV"
-          echo "signed=true" >> "$GITHUB_OUTPUT"
-
-      # 关键修复 2：无密钥时显式关闭签名/公证，让 electron-builder 仍能出包
-      - name: 计算构建参数
-        id: build_args
-        shell: bash
-        run: |
-          if [ "${{ steps.apple_key.outputs.signed }}" = "true" ]; then
-            echo "extra=" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::未配置 Apple 签名密钥，本次构建未签名版本"
-            echo "extra=--config.mac.notarize=false --config.mac.hardenedRuntime=false" >> "$GITHUB_OUTPUT"
-            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
-          fi
-
-      - name: Build macOS
-        shell: bash
-        run: pnpm run build:mac -- ${{ steps.build_args.outputs.extra }}
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: artifact-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            dist/*.dmg
-            dist/*.zip
-            dist/*.yml
-            dist/*.blockmap
-          if-no-files-found: warn
+  #   # ③ macOS 构建：密钥缺失时不再失败，改为构建未签名版本
+  #   build-mac:
+  #     name: Build on ${{ matrix.os }} (${{ matrix.arch }})
+  #     needs: version
+  #     runs-on: ${{ matrix.os }}
+  #     strategy:
+  #       fail-fast: false
+  #       matrix:
+  #         include:
+  #           - os: macos-15
+  #             arch: arm64
+  #           - os: macos-15-intel
+  #             arch: x64
+  #     permissions:
+  #       contents: read
+  #     env:
+  #       RELEASE_VERSION: ${{ needs.version.outputs.version }}
+  #       # 这些 Secrets 允许为空；为空时走 unsigned 分支
+  #       APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+  #       APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+  #       APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+  #       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+  #     steps:
+  #       - uses: actions/checkout@v4
+  #         with:
+  #           fetch-depth: 1
+  #
+  #       - name: 写入版本号到 package.json
+  #         shell: bash
+  #         run: |
+  #           node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); pkg.version=process.env.RELEASE_VERSION; fs.writeFileSync('package.json', JSON.stringify(pkg,null,2)+'\n');"
+  #
+  #       - uses: pnpm/action-setup@v2
+  #         with:
+  #           version: 10.33.0
+  #           run_install: false
+  #
+  #       - uses: actions/setup-python@v5
+  #         with:
+  #           python-version: '3.10'
+  #
+  #       - uses: actions/setup-node@v4
+  #         with:
+  #           node-version: 22
+  #           cache: pnpm
+  #
+  #       - name: Install deps (workspace root)
+  #         shell: bash
+  #         run: pnpm install --frozen-lockfile --ignore-workspace
+  #
+  #       - name: Install deps (project)
+  #         shell: bash
+  #         run: pnpm install --frozen-lockfile
+  #
+  #       - name: Install deps (setting plugin)
+  #         shell: bash
+  #         working-directory: internal-plugins/setting
+  #         run: pnpm install --frozen-lockfile --ignore-workspace
+  #
+  #       # 关键修复 1：密钥为空时跳过这一步，不再 exit 1
+  #       - name: 准备 Apple 签名密钥（有密钥才执行）
+  #         id: apple_key
+  #         if: ${{ env.APPLE_API_KEY_BASE64 != '' && env.APPLE_API_KEY_ID != '' }}
+  #         shell: bash
+  #         run: |
+  #           key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+  #           node -e 'const fs=require("fs"); fs.writeFileSync(process.argv[1], Buffer.from(process.env.APPLE_API_KEY_BASE64, "base64"))' "$key_path"
+  #           test -s "$key_path"
+  #           grep -q 'BEGIN PRIVATE KEY' "$key_path"
+  #           chmod 600 "$key_path"
+  #           echo "APPLE_API_KEY=$key_path" >> "$GITHUB_ENV"
+  #           echo "signed=true" >> "$GITHUB_OUTPUT"
+  #
+  #       # 关键修复 2：无密钥时显式关闭签名/公证，让 electron-builder 仍能出包
+  #       - name: 计算构建参数
+  #         id: build_args
+  #         shell: bash
+  #         run: |
+  #           if [ "${{ steps.apple_key.outputs.signed }}" = "true" ]; then
+  #             echo "extra=" >> "$GITHUB_OUTPUT"
+  #           else
+  #             echo "::warning::未配置 Apple 签名密钥，本次构建未签名版本"
+  #             echo "extra=--config.mac.notarize=false --config.mac.hardenedRuntime=false" >> "$GITHUB_OUTPUT"
+  #             echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
+  #           fi
+  #
+  #       - name: Build macOS
+  #         shell: bash
+  #         run: pnpm run build:mac -- ${{ steps.build_args.outputs.extra }}
+  #
+  #       - name: Upload macOS artifact
+  #         uses: actions/upload-artifact@v4
+  #         with:
+  #           name: artifact-${{ matrix.os }}-${{ matrix.arch }}
+  #           path: |
+  #             dist/*.dmg
+  #             dist/*.zip
+  #             dist/*.yml
+  #             dist/*.blockmap
+  #           if-no-files-found: warn
 
   # ④ 关键修复 3：发布任务不再被某个失败的子 job 拖垮
   release:
     name: Create / update GitHub Release
-    needs: [version, build-win, build-mac]
+    # 恢复 macOS 构建时改回 [version, build-win, build-mac]
+    needs: [version, build-win]
+    # 原条件：needs.build-win.result == 'success' || needs.build-mac.result == 'success'
     if: >-
       ${{
         always() &&
         needs.version.result == 'success' &&
-        (needs.build-win.result == 'success' || needs.build-mac.result == 'success')
+        needs.build-win.result == 'success'
       }}
     runs-on: ubuntu-latest
     permissions:
