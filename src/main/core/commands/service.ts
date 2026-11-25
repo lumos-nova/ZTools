@@ -31,6 +31,10 @@ export interface CommandServiceDependencies {
   queryMainPush: (path: string, code: string, data: any) => Promise<any[]>
   selectMainPush: (path: string, code: string, data: any) => Promise<boolean>
   stateChanged: () => void
+  /** 指令可用性检查；未提供时不过滤搜索结果。 */
+  isCommandAvailable?: (command: Command) => Promise<boolean>
+  /** 目录最长有效期（毫秒）；到期后下一次查询会重建。0 表示不按时间刷新。 */
+  catalogTtlMs?: number
 }
 
 interface SearchSession {
@@ -53,6 +57,7 @@ export class CommandService {
   private sessions = new Map<string, SearchSession>()
   private snapshots = new Map<string, Map<number, SearchSession>>()
   private launchQueue: Promise<unknown> = Promise.resolve()
+  private catalogBuiltAt = 0
 
   /**
    * 注入平台适配器，业务服务不直接依赖 Electron 或窗口。
@@ -86,7 +91,10 @@ export class CommandService {
    */
   private async ensureCatalog(): Promise<void> {
     if (this.building) await this.building
-    if (!this.dirty) return
+    // 超过有效期后重建，保证外部新增或删除的快捷方式能进入下一次查询。
+    const ttl = this.dependencies.catalogTtlMs ?? 5000
+    if (!this.dirty && (ttl <= 0 || Date.now() - this.catalogBuiltAt < ttl)) return
+    this.dirty = true
     this.building = (async () => {
       while (this.dirty) {
         const generation = this.catalogGeneration
@@ -94,6 +102,7 @@ export class CommandService {
         const catalog = await this.dependencies.worker.publish(input)
         if (generation !== this.catalogGeneration) continue
         this.catalog = catalog
+        this.catalogBuiltAt = Date.now()
         this.dirty = false
       }
     })()
@@ -155,6 +164,50 @@ export class CommandService {
   }
 
   /**
+   * 过滤指令列表中路径已失效的项目，同一路径只检查一次。
+   * @param items 待过滤指令
+   * @returns 可用指令
+   */
+  private async filterUnavailableItems(items: Command[]): Promise<Command[]> {
+    const check = this.dependencies.isCommandAvailable
+    if (!check) return items
+
+    const candidates = new Map<string, Command>()
+    for (const item of items) {
+      if (item.path && !candidates.has(item.path)) candidates.set(item.path, item)
+    }
+    if (!candidates.size) return items
+
+    const availability = new Map<string, boolean>()
+    await Promise.all(
+      [...candidates.entries()].map(async ([shortcutPath, command]) => {
+        availability.set(shortcutPath, await check(command))
+      })
+    )
+    return items.filter((item) => !item.path || availability.get(item.path) !== false)
+  }
+
+  /**
+   * 剔除搜索结果中路径已失效的指令，避免最佳搜索结果显示无法打开的项目。
+   * 应用、插件、系统设置、本地启动项等带路径的来源都会被检查。
+   * @param results Worker 返回的搜索结果
+   * @returns 过滤后的搜索结果
+   */
+  private async filterUnavailableCommands(
+    results: CommandSearchResult
+  ): Promise<CommandSearchResult> {
+    if (!this.dependencies.isCommandAvailable) return results
+
+    const [bestSearchResults, allListModeResults, panelResults] = await Promise.all([
+      this.filterUnavailableItems(results.bestSearchResults),
+      this.filterUnavailableItems(results.allListModeResults),
+      this.filterUnavailableItems(results.panelResults)
+    ])
+
+    return { ...results, bestSearchResults, allListModeResults, panelResults }
+  }
+
+  /**
    * 检查查询仍属于当前会话，防止异步结果写回其它输入。
    * @param key 调用方与会话组合键
    * @param session 查询快照
@@ -204,7 +257,14 @@ export class CommandService {
       )
       if (!this.current(key, session) || generation !== this.catalogGeneration)
         return emptyCommandSearchResult(request)
-      const result = { ...matches, sessionId: request.sessionId, requestId: request.requestId }
+      const result = await this.filterUnavailableCommands({
+        ...matches,
+        sessionId: request.sessionId,
+        requestId: request.requestId
+      })
+      // 可用性检查期间来源可能已失效，丢弃过期结果避免写回旧目录数据。
+      if (!this.current(key, session) || generation !== this.catalogGeneration)
+        return emptyCommandSearchResult(request)
       session.result = result
       const snapshots = this.snapshots.get(key) || new Map<number, SearchSession>()
       snapshots.set(request.requestId, session)
@@ -554,12 +614,33 @@ export class CommandService {
       const items = this.reconcile(item.items || [])
       return items.length > 1 ? [{ ...item, items }] : items
     })
-    return structuredClone({
+    const home: CommandHomeState = {
       history: this.reconcile(state.history),
       pinned: this.reconcile(state.pinned),
       superPanelPinned: panel,
       recommendationPins: state.recommendationPins
-    })
+    }
+    if (!this.dependencies.isCommandAvailable) return structuredClone(home)
+
+    // 历史与固定项也来自缓存目录，需按实时可用性再过滤一次。
+    const [history, pinned] = await Promise.all([
+      this.filterUnavailableItems(home.history),
+      this.filterUnavailableItems(home.pinned)
+    ])
+    const superPanelPinned = (
+      await Promise.all(
+        home.superPanelPinned.map(async (item: any) => {
+          if (Array.isArray(item?.items)) {
+            const items = await this.filterUnavailableItems(item.items)
+            return items.length ? { ...item, items } : null
+          }
+          const kept = await this.filterUnavailableItems([item])
+          return kept.length ? kept[0] : null
+        })
+      )
+    ).filter(Boolean)
+
+    return structuredClone({ ...home, history, pinned, superPanelPinned })
   }
 
   /**

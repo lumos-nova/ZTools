@@ -61,6 +61,8 @@ import {
 } from '../core/commands/runtime'
 import { startScheduledTasks, stopScheduledTasks } from '../core/scheduledTasks/runtime'
 import { COMMAND_ALIASES_KEY } from '../../shared/commandShared'
+import type { Command } from '../../shared/commandService'
+import { cleanupStaleCommandReferences } from '../core/commands/staleCommandCleanup'
 import { ENABLED_MAIN_PUSH_PLUGINS_KEY, normalizeConfigList } from '../../shared/pluginSettings'
 
 /**
@@ -225,7 +227,16 @@ class APIManager {
         },
         launch: (options) => appsAPI.launch(options),
         queryMainPush: (path, code, data) => pluginManager.queryMainPush(path, code, data),
-        selectMainPush: (path, code, data) => pluginManager.selectMainPush(path, code, data)
+        selectMainPush: (path, code, data) => pluginManager.selectMainPush(path, code, data),
+        // 最佳搜索结果按实时可用性过滤所有来源的指令；文件被外部删除后无需等待目录刷新。
+        // E2E 基准用例会写入大量不存在的临时路径，跳过过滤与定时重建以保持数据稳定。
+        ...(process.env.ZTOOLS_E2E !== '1'
+          ? {
+              isCommandAvailable: (command: Command) =>
+                localShortcutsAPI.isCommandAvailable(command),
+              catalogTtlMs: 5000
+            }
+          : {})
       },
       mainWindow.webContents
     )
@@ -233,6 +244,19 @@ class APIManager {
       () => commandService.getCatalog(),
       () => commandService.invalidate()
     )
+
+    // 启动后清理失效启动项与历史/固定中的失效引用，避免已卸载软件仍被搜到。
+    // E2E 基准用例会写入大量不存在的临时路径，跳过清理以保证用例数据稳定。
+    if (process.env.ZTOOLS_E2E !== '1') {
+      setImmediate(async () => {
+        await localShortcutsAPI.pruneInvalidShortcuts()
+        const result = await cleanupStaleCommandReferences()
+        if (result.changedKeys.length > 0) {
+          // 缓存目录被清理时需要重建索引，仅用户状态变化则只刷新状态。
+          commandService.invalidate(result.changedKeys.includes('cached-commands'))
+        }
+      })
+    }
 
     // 初始化超级面板管理器
     superPanelManager.init(currentWindow)

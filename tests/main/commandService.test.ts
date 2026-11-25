@@ -3,7 +3,11 @@ import { Worker } from 'node:worker_threads'
 import { commandServiceFixture } from '../helpers/commandService'
 import { getCommandId } from '../../src/shared/commandShared'
 import { SearchWorkerClient } from '../../src/main/core/commands/workerClient'
-import { type CommandContext, type CommandSearchRequest } from '../../src/shared/commandService'
+import {
+  type Command,
+  type CommandContext,
+  type CommandSearchRequest
+} from '../../src/shared/commandService'
 
 const context = (searchQuery = '', pastedText: string | null = null): CommandContext => ({
   searchQuery,
@@ -600,5 +604,63 @@ describe('隔离线程预算与恢复', () => {
     } finally {
       client.dispose()
     }
+  })
+
+  it('最佳搜索结果不展示任意来源的失效指令', async () => {
+    const invalidPaths = ['/invalid-shortcut', '/invalid-app', '/invalid-plugin']
+    const isCommandAvailable = vi.fn(
+      async (command: Command) => !invalidPaths.includes(command.path)
+    )
+    const { service } = commandServiceFixture(
+      {
+        localShortcuts: [
+          { name: 'AlphaValid', path: '/valid' },
+          { name: 'AlphaInvalid', path: '/invalid-shortcut' }
+        ],
+        apps: [
+          { name: 'AlphaApp', path: '/valid-app' },
+          { name: 'AlphaAppGone', path: '/invalid-app' }
+        ],
+        plugins: [
+          {
+            name: 'gone',
+            title: 'Gone',
+            path: '/invalid-plugin',
+            main: 'index.html',
+            features: [{ code: 'feature', explain: 'feature', cmds: ['AlphaPluginGone'] }]
+          }
+        ]
+      },
+      {},
+      { isCommandAvailable }
+    )
+
+    const main = await service.query('main', request(1, context('Alpha')))
+    const names = main.bestSearchResults.map((item) => item.name)
+    expect(names).toContain('AlphaValid')
+    expect(names).not.toContain('AlphaInvalid')
+    expect(names).not.toContain('AlphaAppGone')
+    expect(names).not.toContain('AlphaPluginGone')
+    expect(main.allListModeResults.map((item) => item.name)).not.toContain('AlphaInvalid')
+
+    const panel = await service.query('panel', request(1, context('Alpha')))
+    expect(panel.panelResults.map((item) => item.name)).not.toContain('AlphaInvalid')
+    expect(isCommandAvailable).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/invalid-app' })
+    )
+  })
+
+  it('首页历史不展示已卸载软件', async () => {
+    const gone = { name: 'Gone', path: '/gone', type: 'direct' as const, subType: 'app' as const }
+    const keep = { name: 'Keep', path: '/keep', type: 'direct' as const, subType: 'app' as const }
+    const { service } = commandServiceFixture(
+      { apps: [gone, keep] },
+      { 'command-history': [gone, keep] },
+      { isCommandAvailable: vi.fn(async (command: Command) => command.path !== '/gone') }
+    )
+
+    const home = await service.getHome()
+
+    expect(home.history.map((item) => item.name)).toEqual(['Keep'])
   })
 })

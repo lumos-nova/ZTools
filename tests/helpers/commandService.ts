@@ -21,11 +21,13 @@ export interface CommandServiceFixture {
  * 创建无 Electron 副作用的真实业务服务夹具。
  * @param overrides 目录来源覆盖
  * @param documents 用户数据初始值
+ * @param dependencyOverrides 运行时依赖覆盖（如本地启动项可用性检查）
  * @returns 服务、输入与运行时观察器
  */
 export function commandServiceFixture(
   overrides: Partial<CommandCatalogInput> = {},
-  documents: Record<string, any> = {}
+  documents: Record<string, any> = {},
+  dependencyOverrides: Partial<CommandServiceDependencies> = {}
 ): CommandServiceFixture {
   const input: CommandCatalogInput = {
     apps: [],
@@ -63,7 +65,9 @@ export function commandServiceFixture(
     launch,
     queryMainPush,
     selectMainPush,
-    stateChanged: vi.fn()
+    stateChanged: vi.fn(),
+    catalogTtlMs: 0,
+    ...dependencyOverrides
   })
   return { service, input, storage, launch, write, queryMainPush, selectMainPush, worker, sources }
 }
